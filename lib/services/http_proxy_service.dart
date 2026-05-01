@@ -4,7 +4,11 @@ import 'dart:io';
 import 'smb_service.dart';
 
 /// A local HTTP proxy server that streams SMB files to media_kit.
-/// Supports Range requests for seeking in large video files (including 4K).
+///
+/// Uses smb_connect's RandomAccessFile for instant seeking — no more
+/// reading-and-discarding gigabytes of data to reach a byte offset.
+/// Each request opens its own RandomAccessFile handle so concurrent
+/// requests from the player (probing + streaming) don't stomp on each other.
 class HttpProxyService {
   HttpServer? _server;
   SmbService? _smbService;
@@ -13,6 +17,10 @@ class HttpProxyService {
 
   int? get port => _server?.port;
   bool get isRunning => _server != null;
+
+  /// How many bytes to read per chunk when piping to the response.
+  /// 256 KB strikes a good balance between throughput and memory.
+  static const int _chunkSize = 256 * 1024;
 
   /// Start the local HTTP proxy server.
   Future<String> startProxy({
@@ -24,15 +32,13 @@ class HttpProxyService {
     _smbService = smbService;
     _currentFilePath = filePath;
 
-    // Get file size for Range support
+    // Pre-fetch file size once (used for every request's Content-Length).
     _currentFileSize = await smbService.getFileSize(filePath);
 
     _server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
-
     _server!.listen(_handleRequest);
 
-    final url = 'http://127.0.0.1:${_server!.port}/video';
-    return url;
+    return 'http://127.0.0.1:${_server!.port}/video';
   }
 
   /// Handle incoming HTTP requests from media_kit.
@@ -46,35 +52,84 @@ class HttpProxyService {
 
     try {
       final fileSize = _currentFileSize ?? 0;
-      final fileName = _currentFilePath!.split('/').last;
+      if (fileSize == 0) {
+        request.response.statusCode = 404;
+        request.response.write('File is empty or not found');
+        await request.response.close();
+        return;
+      }
 
-      // Determine content type based on extension
+      final fileName = _currentFilePath!.split('/').last;
       final contentType = _getContentType(fileName);
 
-      // Check for Range header (seeking support)
+      // Parse the Range header, if present.
       final rangeHeader = request.headers.value('range');
+      int start = 0;
+      int end = fileSize - 1;
+      bool isPartial = false;
 
       if (rangeHeader != null && rangeHeader.startsWith('bytes=')) {
-        await _handleRangeRequest(
-          request,
-          rangeHeader,
-          fileSize,
-          contentType,
-        );
-      } else {
-        // Full file stream
-        request.response.statusCode = 200;
-        request.response.headers.set('Content-Type', contentType);
-        request.response.headers.set('Content-Length', fileSize);
-        request.response.headers.set('Accept-Ranges', 'bytes');
-        request.response.headers
-            .set('Access-Control-Allow-Origin', '*');
+        isPartial = true;
+        final rangeStr = rangeHeader.substring(6);
+        final parts = rangeStr.split('-');
 
-        final stream =
-            await _smbService!.openReadStream(_currentFilePath!);
-        await request.response.addStream(stream);
-        await request.response.close();
+        if (parts[0].isNotEmpty) {
+          start = int.parse(parts[0]);
+        }
+        if (parts.length > 1 && parts[1].isNotEmpty) {
+          end = int.parse(parts[1]);
+        }
+
+        // Clamp to valid range
+        if (start >= fileSize) start = fileSize - 1;
+        if (end >= fileSize) end = fileSize - 1;
+        if (start > end) start = end;
       }
+
+      final contentLength = end - start + 1;
+
+      // Write response headers
+      if (isPartial) {
+        request.response.statusCode = 206;
+        request.response.headers
+            .set('Content-Range', 'bytes $start-$end/$fileSize');
+      } else {
+        request.response.statusCode = 200;
+      }
+
+      request.response.headers.set('Content-Type', contentType);
+      request.response.headers.set('Content-Length', contentLength);
+      request.response.headers.set('Accept-Ranges', 'bytes');
+      request.response.headers.set('Access-Control-Allow-Origin', '*');
+      request.response.headers.set(
+          'Connection', 'keep-alive');
+
+      // Open a dedicated RandomAccessFile handle for this request.
+      // This gives us O(1) seek — the SMB server jumps directly to
+      // the requested offset instead of reading from byte 0.
+      final raf = await _smbService!.openRandomAccess(_currentFilePath!);
+
+      try {
+        // Seek to the requested start position (instant at the protocol level).
+        await raf.setPosition(start);
+
+        // Stream data in chunks until we've served `contentLength` bytes.
+        int remaining = contentLength;
+
+        while (remaining > 0) {
+          final toRead = remaining < _chunkSize ? remaining : _chunkSize;
+          final bytes = await raf.read(toRead);
+
+          if (bytes.lengthInBytes == 0) break; // EOF
+
+          request.response.add(bytes);
+          remaining -= bytes.lengthInBytes;
+        }
+      } finally {
+        await raf.close();
+      }
+
+      await request.response.close();
     } catch (e) {
       try {
         request.response.statusCode = 500;
@@ -82,80 +137,6 @@ class HttpProxyService {
         await request.response.close();
       } catch (_) {}
     }
-  }
-
-  /// Handle HTTP Range requests for seeking.
-  Future<void> _handleRangeRequest(
-    HttpRequest request,
-    String rangeHeader,
-    int fileSize,
-    String contentType,
-  ) async {
-    // Parse range: "bytes=START-END" or "bytes=START-"
-    final rangeStr = rangeHeader.substring(6); // Remove "bytes="
-    final parts = rangeStr.split('-');
-
-    int start = 0;
-    int end = fileSize - 1;
-
-    if (parts[0].isNotEmpty) {
-      start = int.parse(parts[0]);
-    }
-    if (parts.length > 1 && parts[1].isNotEmpty) {
-      end = int.parse(parts[1]);
-    }
-
-    // Clamp values
-    if (start >= fileSize) start = fileSize - 1;
-    if (end >= fileSize) end = fileSize - 1;
-
-    final contentLength = end - start + 1;
-
-    request.response.statusCode = 206; // Partial Content
-    request.response.headers.set('Content-Type', contentType);
-    request.response.headers.set('Content-Length', contentLength);
-    request.response.headers.set('Accept-Ranges', 'bytes');
-    request.response.headers
-        .set('Content-Range', 'bytes $start-$end/$fileSize');
-    request.response.headers.set('Access-Control-Allow-Origin', '*');
-
-    // Stream from SMB with range
-    // Since smb_connect may not support native range requests,
-    // we stream and skip/limit bytes
-    final stream =
-        await _smbService!.openReadStream(_currentFilePath!);
-
-    int bytesSkipped = 0;
-    int bytesSent = 0;
-
-    await for (final chunk in stream) {
-      if (bytesSent >= contentLength) break;
-
-      int chunkStart = 0;
-      int chunkEnd = chunk.length;
-
-      // Skip bytes we don't need
-      if (bytesSkipped < start) {
-        final remaining = start - bytesSkipped;
-        if (remaining >= chunk.length) {
-          bytesSkipped += chunk.length;
-          continue;
-        }
-        chunkStart = remaining;
-        bytesSkipped = start;
-      }
-
-      // Limit to contentLength
-      final available = chunkEnd - chunkStart;
-      final needed = contentLength - bytesSent;
-      final toSend = available < needed ? available : needed;
-
-      request.response
-          .add(chunk.sublist(chunkStart, chunkStart + toSend));
-      bytesSent += toSend;
-    }
-
-    await request.response.close();
   }
 
   /// Get content type based on file extension.

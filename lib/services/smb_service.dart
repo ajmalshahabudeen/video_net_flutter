@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:typed_data';
+import 'dart:io' as io;
 
 import 'package:smb_connect/smb_connect.dart';
 
@@ -45,8 +45,6 @@ class SmbService {
     if (_connection == null) throw Exception('Not connected');
 
     final shares = await _connection!.listShares();
-    // listShares() returns List<SmbFile>, extract names
-    // Filter out administrative shares (ending with $)
     return shares
         .map((smbFile) => smbFile.name)
         .where((name) => !name.endsWith('\$'))
@@ -68,7 +66,6 @@ class SmbService {
     final result = <SmbFileInfo>[];
     for (final file in files) {
       final name = file.name;
-      // Skip . and .. entries
       if (name == '.' || name == '..') continue;
 
       result.add(SmbFileInfo(
@@ -79,7 +76,6 @@ class SmbService {
       ));
     }
 
-    // Sort: directories first, then alphabetically
     result.sort((a, b) {
       if (a.isDirectory && !b.isDirectory) return -1;
       if (!a.isDirectory && b.isDirectory) return 1;
@@ -89,42 +85,28 @@ class SmbService {
     return result;
   }
 
-  /// Read a file as bytes (for smaller files or chunks).
-  Future<Uint8List> readFile(String filePath) async {
-    if (_connection == null) throw Exception('Not connected');
-
-    final file = await _connection!.file(filePath);
-    final stream = await _connection!.openRead(file);
-
-    final chunks = <List<int>>[];
-    await for (final chunk in stream) {
-      chunks.add(chunk);
-    }
-
-    final totalLength = chunks.fold<int>(0, (sum, c) => sum + c.length);
-    final result = Uint8List(totalLength);
-    int offset = 0;
-    for (final chunk in chunks) {
-      result.setRange(offset, offset + chunk.length, chunk);
-      offset += chunk.length;
-    }
-
-    return result;
-  }
-
-  /// Open a file read stream (for streaming large video files).
-  Future<Stream<List<int>>> openReadStream(String filePath) async {
-    if (_connection == null) throw Exception('Not connected');
-
-    final file = await _connection!.file(filePath);
-    return await _connection!.openRead(file);
-  }
-
   /// Get file size.
   Future<int> getFileSize(String filePath) async {
     if (_connection == null) throw Exception('Not connected');
 
     final file = await _connection!.file(filePath);
     return file.size;
+  }
+
+  /// Open a RandomAccessFile for seeking directly at the SMB protocol level.
+  /// This avoids the massive performance penalty of streaming-then-skipping.
+  Future<io.RandomAccessFile> openRandomAccess(String filePath) async {
+    if (_connection == null) throw Exception('Not connected');
+
+    final file = await _connection!.file(filePath);
+    return await _connection!.open(file);
+  }
+
+  /// Open a file read stream (for full sequential reads only).
+  Future<Stream<List<int>>> openReadStream(String filePath) async {
+    if (_connection == null) throw Exception('Not connected');
+
+    final file = await _connection!.file(filePath);
+    return await _connection!.openRead(file);
   }
 }
