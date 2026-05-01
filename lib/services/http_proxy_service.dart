@@ -1,39 +1,51 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 
 import 'smb_service.dart';
+import 'video_chunk_cache.dart';
 
 /// A local HTTP proxy server that streams SMB files to media_kit.
 ///
-/// Uses smb_connect's RandomAccessFile for instant seeking — no more
-/// reading-and-discarding gigabytes of data to reach a byte offset.
-/// Each request opens its own RandomAccessFile handle so concurrent
-/// requests from the player (probing + streaming) don't stomp on each other.
+/// All reads go through [VideoChunkCache] which:
+///  - Caches 2 MB chunks to disk (seeking to cached positions is instant).
+///  - Prefetches upcoming chunks in the background (YouTube-style buffer).
+///  - Fetches multiple chunks in parallel (4 concurrent SMB workers).
+///  - Pre-warms the first + last chunks on startup for fast MP4 init.
 class HttpProxyService {
   HttpServer? _server;
-  SmbService? _smbService;
-  String? _currentFilePath;
-  int? _currentFileSize;
+  VideoChunkCache? _cache;
+  int? _fileSize;
 
   int? get port => _server?.port;
   bool get isRunning => _server != null;
 
-  /// How many bytes to read per chunk when piping to the response.
-  /// 256 KB strikes a good balance between throughput and memory.
-  static const int _chunkSize = 256 * 1024;
+  /// Expose cache for progress/diagnostics if needed.
+  VideoChunkCache? get cache => _cache;
 
-  /// Start the local HTTP proxy server.
+  /// How many bytes to serve per response write.
+  /// 512 KB keeps memory low while minimising per-write overhead.
+  static const int _responseChunkSize = 512 * 1024;
+
+  /// Start the proxy, initialise the chunk cache, and begin pre-warming.
   Future<String> startProxy({
     required SmbService smbService,
     required String filePath,
   }) async {
     await stopProxy();
 
-    _smbService = smbService;
-    _currentFilePath = filePath;
+    _fileSize = await smbService.getFileSize(filePath);
 
-    // Pre-fetch file size once (used for every request's Content-Length).
-    _currentFileSize = await smbService.getFileSize(filePath);
+    _cache = VideoChunkCache(
+      smbService: smbService,
+      filePath: filePath,
+      fileSize: _fileSize!,
+    );
+    await _cache!.initialize();
+
+    // Fire pre-warm in the background — fetches first + last chunks
+    // in parallel so media_kit can start playing almost immediately.
+    unawaited(_cache!.preWarm());
 
     _server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     _server!.listen(_handleRequest);
@@ -43,7 +55,10 @@ class HttpProxyService {
 
   /// Handle incoming HTTP requests from media_kit.
   Future<void> _handleRequest(HttpRequest request) async {
-    if (_smbService == null || _currentFilePath == null) {
+    final cache = _cache;
+    final fileSize = _fileSize ?? 0;
+
+    if (cache == null || fileSize == 0) {
       request.response.statusCode = 500;
       request.response.write('No file configured');
       await request.response.close();
@@ -51,18 +66,7 @@ class HttpProxyService {
     }
 
     try {
-      final fileSize = _currentFileSize ?? 0;
-      if (fileSize == 0) {
-        request.response.statusCode = 404;
-        request.response.write('File is empty or not found');
-        await request.response.close();
-        return;
-      }
-
-      final fileName = _currentFilePath!.split('/').last;
-      final contentType = _getContentType(fileName);
-
-      // Parse the Range header, if present.
+      // ── Parse Range header ──────────────────────────────
       final rangeHeader = request.headers.value('range');
       int start = 0;
       int end = fileSize - 1;
@@ -70,63 +74,37 @@ class HttpProxyService {
 
       if (rangeHeader != null && rangeHeader.startsWith('bytes=')) {
         isPartial = true;
-        final rangeStr = rangeHeader.substring(6);
-        final parts = rangeStr.split('-');
-
-        if (parts[0].isNotEmpty) {
-          start = int.parse(parts[0]);
-        }
+        final parts = rangeHeader.substring(6).split('-');
+        if (parts[0].isNotEmpty) start = int.parse(parts[0]);
         if (parts.length > 1 && parts[1].isNotEmpty) {
           end = int.parse(parts[1]);
         }
-
-        // Clamp to valid range
-        if (start >= fileSize) start = fileSize - 1;
-        if (end >= fileSize) end = fileSize - 1;
-        if (start > end) start = end;
+        start = start.clamp(0, fileSize - 1);
+        end = end.clamp(start, fileSize - 1);
       }
 
       final contentLength = end - start + 1;
 
-      // Write response headers
-      if (isPartial) {
-        request.response.statusCode = 206;
-        request.response.headers
-            .set('Content-Range', 'bytes $start-$end/$fileSize');
-      } else {
-        request.response.statusCode = 200;
-      }
-
-      request.response.headers.set('Content-Type', contentType);
+      // ── Response headers ────────────────────────────────
+      final fileName = request.uri.pathSegments.lastOrNull ?? 'video';
+      request.response.statusCode = isPartial ? 206 : 200;
+      request.response.headers.set('Content-Type', _getContentType(fileName));
       request.response.headers.set('Content-Length', contentLength);
       request.response.headers.set('Accept-Ranges', 'bytes');
       request.response.headers.set('Access-Control-Allow-Origin', '*');
-      request.response.headers.set(
-          'Connection', 'keep-alive');
+      request.response.headers.set('Connection', 'keep-alive');
+      if (isPartial) {
+        request.response.headers
+            .set('Content-Range', 'bytes $start-$end/$fileSize');
+      }
 
-      // Open a dedicated RandomAccessFile handle for this request.
-      // This gives us O(1) seek — the SMB server jumps directly to
-      // the requested offset instead of reading from byte 0.
-      final raf = await _smbService!.openRandomAccess(_currentFilePath!);
-
-      try {
-        // Seek to the requested start position (instant at the protocol level).
-        await raf.setPosition(start);
-
-        // Stream data in chunks until we've served `contentLength` bytes.
-        int remaining = contentLength;
-
-        while (remaining > 0) {
-          final toRead = remaining < _chunkSize ? remaining : _chunkSize;
-          final bytes = await raf.read(toRead);
-
-          if (bytes.lengthInBytes == 0) break; // EOF
-
-          request.response.add(bytes);
-          remaining -= bytes.lengthInBytes;
-        }
-      } finally {
-        await raf.close();
+      // ── Stream from cache in manageable pieces ──────────
+      int pos = start;
+      while (pos <= end) {
+        final readEnd = min(pos + _responseChunkSize - 1, end);
+        final data = await cache.readRange(pos, readEnd);
+        request.response.add(data);
+        pos = readEnd + 1;
       }
 
       await request.response.close();
@@ -155,13 +133,16 @@ class HttpProxyService {
     return 'application/octet-stream';
   }
 
-  /// Stop the proxy server.
+  /// Stop the proxy server and dispose the cache.
   Future<void> stopProxy() async {
     if (_server != null) {
       await _server!.close(force: true);
       _server = null;
     }
-    _currentFilePath = null;
-    _currentFileSize = null;
+    if (_cache != null) {
+      await _cache!.dispose();
+      _cache = null;
+    }
+    _fileSize = null;
   }
 }
