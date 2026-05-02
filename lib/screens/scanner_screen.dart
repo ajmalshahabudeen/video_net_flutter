@@ -6,13 +6,27 @@ import '../state/app_state.dart';
 import '../theme/brutalist_theme.dart';
 import '../widgets/brutalist_button.dart';
 import '../widgets/brutalist_card.dart';
+import '../services/update_service.dart';
 import '../widgets/scan_progress_indicator.dart';
 import 'credentials_screen.dart';
 
 /// Screen 1: Network Scanner
 /// Scans the local subnet for hosts with SMB ports open.
-class ScannerScreen extends StatelessWidget {
+class ScannerScreen extends StatefulWidget {
   const ScannerScreen({super.key});
+
+  @override
+  State<ScannerScreen> createState() => _ScannerScreenState();
+}
+
+class _ScannerScreenState extends State<ScannerScreen> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      UpdateService.checkForUpdates(context);
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
