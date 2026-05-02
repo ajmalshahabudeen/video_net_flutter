@@ -30,7 +30,12 @@ jobs:
 
       - name: Setup Keystore
         run: |
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > android/upload-keystore.jks
+          cat << 'EOF' > keystore_b64.txt
+          ${{ secrets.KEYSTORE_BASE64 }}
+          EOF
+          sed -i '/CERTIFICATE/d' keystore_b64.txt
+          base64 -d -i keystore_b64.txt > android/upload-keystore.jks
+          rm keystore_b64.txt
           echo "storePassword=${{ secrets.STORE_PASSWORD }}" > android/key.properties
           echo "keyPassword=${{ secrets.KEY_PASSWORD }}" >> android/key.properties
           echo "keyAlias=${{ secrets.ALIAS }}" >> android/key.properties
