@@ -38,6 +38,8 @@ dependencies:
 
   # Path utilities
   path: ^1.9.1
+  volume_controller: ^3.4.4
+  screen_brightness: ^2.1.7
 
 dev_dependencies:
   flutter_test:

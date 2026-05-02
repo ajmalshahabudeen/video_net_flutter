@@ -390,6 +390,23 @@ class _FileItem extends StatelessWidget {
     AppState state,
     SmbFileInfo file,
   ) async {
+    // Collect all video files in the current directory for next/prev
+    final allFiles = state.files;
+    final videoFiles = allFiles.where((f) => f.isVideo).toList();
+    final currentIndex = videoFiles.indexWhere((f) => f.path == file.path);
+
+    _openVideoAtIndex(context, state, videoFiles, currentIndex);
+  }
+
+  static Future<void> _openVideoAtIndex(
+    BuildContext context,
+    AppState state,
+    List<SmbFileInfo> videoFiles,
+    int index,
+  ) async {
+    if (index < 0 || index >= videoFiles.length) return;
+    final file = videoFiles[index];
+
     // Show loading dialog
     showDialog(
       context: context,
@@ -438,12 +455,21 @@ class _FileItem extends StatelessWidget {
       Navigator.pop(context); // Close loading dialog
 
       if (url != null) {
-        Navigator.push(
+        // Replace the current video player screen
+        Navigator.pushReplacement(
           context,
           MaterialPageRoute(
-            builder: (_) => VideoPlayerScreen(
+            builder: (ctx) => VideoPlayerScreen(
               videoUrl: url,
               videoName: file.name,
+              onNextVideo: index < videoFiles.length - 1
+                  ? () => _openVideoAtIndex(
+                      ctx, state, videoFiles, index + 1)
+                  : null,
+              onPreviousVideo: index > 0
+                  ? () => _openVideoAtIndex(
+                      ctx, state, videoFiles, index - 1)
+                  : null,
             ),
           ),
         );
