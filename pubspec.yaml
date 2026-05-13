@@ -2,7 +2,7 @@ name: video_net_flutter
 description: "Network video scanner & player with Neo-Brutalist design."
 publish_to: 'none'
 
-version: 1.0.6
+version: 1.0.7
 
 environment:
   sdk: ^3.11.5
