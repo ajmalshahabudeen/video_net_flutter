@@ -21,10 +21,16 @@ class VideoChunkCache {
   static const int chunkSize = 2 * 1024 * 1024; // 2 MB
 
   /// How many chunks to prefetch ahead of the current playback position.
-  static const int prefetchAhead = 12; // ~24 MB buffer
+  static const int prefetchAhead = 20; // ~40 MB buffer
 
   /// Maximum parallel SMB reads at any given time.
-  static const int maxParallel = 4;
+  static const int maxParallel = 8;
+
+  /// Maximum retries per chunk fetch before giving up.
+  static const int maxRetries = 3;
+
+  /// Cache directory prefix for identifying our temp files.
+  static const String _cacheDirPrefix = 'vnet_';
 
   final SmbService smbService;
   final String filePath;
@@ -41,6 +47,9 @@ class VideoChunkCache {
 
   /// Completers so multiple callers can await the same in-flight fetch.
   final Map<int, Completer<void>> _fetchCompleters = {};
+
+  /// Track chunks that have permanently failed (after retries).
+  final Set<int> _failedChunks = {};
 
   /// Simple async semaphore to cap parallel SMB reads.
   final _Semaphore _sem = _Semaphore(maxParallel);
@@ -60,7 +69,7 @@ class VideoChunkCache {
   /// Prepare the cache directory and scan for already-cached chunks.
   Future<void> initialize() async {
     final hash = '${filePath.hashCode.abs()}_$fileSize';
-    _cacheDir = Directory('${Directory.systemTemp.path}/vnet_$hash');
+    _cacheDir = Directory('${Directory.systemTemp.path}/$_cacheDirPrefix$hash');
     if (!await _cacheDir.exists()) {
       await _cacheDir.create(recursive: true);
     }
@@ -84,11 +93,65 @@ class VideoChunkCache {
     }
     _fetchCompleters.clear();
     _cached.clear();
+    _failedChunks.clear();
     try {
       if (await _cacheDir.exists()) {
         await _cacheDir.delete(recursive: true);
       }
     } catch (_) {}
+  }
+
+  // ─── STATIC CACHE MANAGEMENT ─────────────────────────────
+
+  /// Clear ALL video chunk caches from the temp directory.
+  /// Call this on the home screen to free disk space.
+  static Future<int> clearAllCaches() async {
+    int bytesCleared = 0;
+    final tempDir = Directory.systemTemp;
+
+    try {
+      await for (final entity in tempDir.list()) {
+        if (entity is Directory &&
+            entity.uri.pathSegments
+                .any((seg) => seg.startsWith(_cacheDirPrefix))) {
+          try {
+            // Calculate size before deleting
+            await for (final file in entity.list(recursive: true)) {
+              if (file is File) {
+                bytesCleared += await file.length();
+              }
+            }
+            await entity.delete(recursive: true);
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+
+    return bytesCleared;
+  }
+
+  /// Get total size of all cached chunks on disk.
+  static Future<int> getTotalCacheSize() async {
+    int totalSize = 0;
+    final tempDir = Directory.systemTemp;
+
+    try {
+      await for (final entity in tempDir.list()) {
+        if (entity is Directory &&
+            entity.uri.pathSegments
+                .any((seg) => seg.startsWith(_cacheDirPrefix))) {
+          try {
+            await for (final file in entity.list(recursive: true)) {
+              if (file is File) {
+                totalSize += await file.length();
+              }
+            }
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+
+    return totalSize;
   }
 
   // ─── PRE-WARM ─────────────────────────────────────────────
@@ -100,21 +163,27 @@ class VideoChunkCache {
 
     final targets = <int>[];
 
-    // First 5 chunks (10 MB) — immediate playback data.
-    for (int i = 0; i < min(5, totalChunks); i++) {
+    // First 8 chunks (16 MB) — immediate playback data.
+    for (int i = 0; i < min(8, totalChunks); i++) {
       if (!_cached.contains(i)) targets.add(i);
     }
 
     // Last chunk — MP4 moov/mdat atom is often here.
     final last = totalChunks - 1;
-    if (last >= 5 && !_cached.contains(last)) targets.add(last);
+    if (last >= 8 && !_cached.contains(last)) targets.add(last);
+
+    // Second-to-last chunk — some MP4s have moov spanning 2 chunks.
+    final secondLast = totalChunks - 2;
+    if (secondLast >= 8 && !_cached.contains(secondLast)) {
+      targets.add(secondLast);
+    }
 
     if (targets.isNotEmpty) {
       await _fetchMany(targets);
     }
 
-    // Continue prefetching from chunk 5 onwards in the background.
-    _prefetchFrom(min(5, totalChunks));
+    // Continue prefetching from chunk 8 onwards in the background.
+    _prefetchFrom(min(8, totalChunks));
   }
 
   // ─── READ ─────────────────────────────────────────────────
@@ -168,6 +237,7 @@ class VideoChunkCache {
   }
 
   /// Guarantee that chunk [idx] is on disk. De-duplicates concurrent calls.
+  /// Retries up to [maxRetries] times on failure.
   Future<void> _ensureFetched(int idx) async {
     if (_cached.contains(idx) || _disposed) return;
 
@@ -184,10 +254,25 @@ class VideoChunkCache {
     try {
       await _sem.acquire(); // wait for a slot
       if (_disposed || _cached.contains(idx)) return;
-      await _fetchFromSmb(idx);
-      _cached.add(idx);
-    } catch (_) {
-      // Swallow — caller will see the chunk is still missing.
+
+      // Retry loop
+      for (int attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          await _fetchFromSmb(idx);
+          _cached.add(idx);
+          _failedChunks.remove(idx);
+          break; // success
+        } catch (e) {
+          if (attempt == maxRetries) {
+            _failedChunks.add(idx);
+            // Swallow — caller will see the chunk is still missing.
+          } else {
+            // Brief delay before retry
+            await Future.delayed(
+                Duration(milliseconds: 200 * attempt));
+          }
+        }
+      }
     } finally {
       _sem.release();
       _fetching.remove(idx);
@@ -231,16 +316,40 @@ class VideoChunkCache {
           i < min(from + prefetchAhead, totalChunks);
           i++) {
         if (_disposed) break;
-        if (!_cached.contains(i) && !_fetching.contains(i)) {
+        if (!_cached.contains(i) &&
+            !_fetching.contains(i) &&
+            !_failedChunks.contains(i)) {
           unawaited(_ensureFetched(i));
         }
       }
     });
   }
 
+  // ─── CACHE REPAIR ────────────────────────────────────────
+
+  /// Clear this specific cache and reset state for re-fetching.
+  /// Useful when playback is stuck due to corrupted or failed chunks.
+  Future<void> clearAndReset() async {
+    _cached.clear();
+    _failedChunks.clear();
+    _fetching.clear();
+    for (final c in _fetchCompleters.values) {
+      if (!c.isCompleted) c.complete();
+    }
+    _fetchCompleters.clear();
+
+    try {
+      if (await _cacheDir.exists()) {
+        await _cacheDir.delete(recursive: true);
+        await _cacheDir.create(recursive: true);
+      }
+    } catch (_) {}
+  }
+
   // ─── DIAGNOSTICS ──────────────────────────────────────────
 
   int get cachedChunkCount => _cached.length;
+  int get failedChunkCount => _failedChunks.length;
   double get progress =>
       totalChunks > 0 ? _cached.length / totalChunks : 0.0;
   bool isRangeCached(int start, int end) {
@@ -249,6 +358,8 @@ class VideoChunkCache {
     }
     return true;
   }
+
+  bool get hasFailedChunks => _failedChunks.isNotEmpty;
 }
 
 // ─── ASYNC SEMAPHORE ──────────────────────────────────────────

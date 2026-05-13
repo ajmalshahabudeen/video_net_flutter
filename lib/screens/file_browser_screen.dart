@@ -9,10 +9,18 @@ import 'video_player_screen.dart';
 
 /// Screen 3: File Browser
 /// Browses files and folders on the selected SMB share.
-class FileBrowserScreen extends StatelessWidget {
+/// Supports list and grid view with video thumbnails.
+class FileBrowserScreen extends StatefulWidget {
   final String shareName;
 
   const FileBrowserScreen({super.key, required this.shareName});
+
+  @override
+  State<FileBrowserScreen> createState() => _FileBrowserScreenState();
+}
+
+class _FileBrowserScreenState extends State<FileBrowserScreen> {
+  bool _isGridView = false;
 
   @override
   Widget build(BuildContext context) {
@@ -41,30 +49,54 @@ class FileBrowserScreen extends StatelessWidget {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        GestureDetector(
-                          onTap: () async {
-                            final navigated =
-                                await state.navigateBack();
-                            if (!navigated && context.mounted) {
-                              Navigator.pop(context);
-                            }
-                          },
-                          child: Row(
-                            children: [
-                              const Icon(Icons.arrow_back,
-                                  color: BrutalistTheme.white,
-                                  size: 18),
-                              const SizedBox(width: 8),
-                              Text(
-                                'BACK',
-                                style: BrutalistTheme.labelLarge
-                                    .copyWith(
-                                  color: BrutalistTheme.white,
-                                  fontSize: 11,
+                        Row(
+                          children: [
+                            GestureDetector(
+                              onTap: () async {
+                                final navigated =
+                                    await state.navigateBack();
+                                if (!navigated && context.mounted) {
+                                  Navigator.pop(context);
+                                }
+                              },
+                              child: Row(
+                                children: [
+                                  const Icon(Icons.arrow_back,
+                                      color: BrutalistTheme.white,
+                                      size: 18),
+                                  const SizedBox(width: 8),
+                                  Text(
+                                    'BACK',
+                                    style: BrutalistTheme.labelLarge
+                                        .copyWith(
+                                      color: BrutalistTheme.white,
+                                      fontSize: 11,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const Spacer(),
+                            // ─── VIEW TOGGLE ─────
+                            GestureDetector(
+                              onTap: () =>
+                                  setState(() => _isGridView = !_isGridView),
+                              child: Container(
+                                padding: const EdgeInsets.all(6),
+                                decoration: BoxDecoration(
+                                  border: Border.all(
+                                      color: BrutalistTheme.white, width: 2),
+                                ),
+                                child: Icon(
+                                  _isGridView
+                                      ? Icons.view_list
+                                      : Icons.grid_view,
+                                  color: BrutalistTheme.accent,
+                                  size: 20,
                                 ),
                               ),
-                            ],
-                          ),
+                            ),
+                          ],
                         ),
                         const SizedBox(height: 12),
                         Text(
@@ -80,11 +112,11 @@ class FileBrowserScreen extends StatelessWidget {
 
                   // ─── BREADCRUMB ──────────────
                   _BreadcrumbBar(
-                    shareName: shareName,
+                    shareName: widget.shareName,
                     currentPath: state.currentPath,
                   ),
 
-                  // ─── FILE LIST ───────────────
+                  // ─── FILE LIST / GRID ─────────
                   Expanded(
                     child: state.isLoadingFiles
                         ? Center(
@@ -129,7 +161,9 @@ class FileBrowserScreen extends StatelessWidget {
                                       ],
                                     ),
                                   )
-                                : _FileList(files: state.files),
+                                : _isGridView
+                                    ? _FileGrid(files: state.files)
+                                    : _FileList(files: state.files),
                   ),
                 ],
               );
@@ -227,7 +261,171 @@ class _FileList extends StatelessWidget {
   }
 }
 
-/// Individual file/folder item.
+/// File grid view.
+class _FileGrid extends StatelessWidget {
+  final List<SmbFileInfo> files;
+
+  const _FileGrid({required this.files});
+
+  @override
+  Widget build(BuildContext context) {
+    return GridView.builder(
+      padding: const EdgeInsets.all(12),
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 2,
+        crossAxisSpacing: 8,
+        mainAxisSpacing: 8,
+        childAspectRatio: 1.0,
+      ),
+      itemCount: files.length,
+      itemBuilder: (context, index) {
+        final file = files[index];
+        return _FileGridItem(file: file);
+      },
+    );
+  }
+}
+
+/// Grid item for a file/folder.
+class _FileGridItem extends StatelessWidget {
+  final SmbFileInfo file;
+
+  const _FileGridItem({required this.file});
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.read<AppState>();
+    final isInteractive = file.isDirectory || file.isVideo;
+
+    IconData icon;
+    Color iconBg;
+    Color iconColor;
+
+    if (file.isDirectory) {
+      icon = Icons.folder;
+      iconBg = BrutalistTheme.warning;
+      iconColor = BrutalistTheme.black;
+    } else if (file.isVideo) {
+      icon = Icons.play_circle_filled;
+      iconBg = BrutalistTheme.accent;
+      iconColor = BrutalistTheme.white;
+    } else {
+      icon = Icons.insert_drive_file;
+      iconBg = BrutalistTheme.concrete;
+      iconColor = BrutalistTheme.darkConcrete;
+    }
+
+    return BrutalistCard(
+      backgroundColor: isInteractive
+          ? BrutalistTheme.white
+          : BrutalistTheme.concrete.withValues(alpha: 0.7),
+      showShadow: isInteractive,
+      onTap: isInteractive
+          ? () async {
+              if (file.isDirectory) {
+                final dirPath =
+                    _getRelativePath(file.path, state.currentShare!);
+                await state.openDirectory(dirPath);
+              } else if (file.isVideo) {
+                _FileItem._openVideo(context, state, file);
+              }
+            }
+          : null,
+      padding: const EdgeInsets.all(10),
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          // Thumbnail area
+          Expanded(
+            child: Container(
+              width: double.infinity,
+              decoration: BoxDecoration(
+                color: file.isVideo
+                    ? BrutalistTheme.black
+                    : iconBg.withValues(alpha: 0.15),
+                border: Border.all(color: BrutalistTheme.black, width: 2),
+              ),
+              child: file.isVideo
+                  ? Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        // Video icon as thumbnail placeholder
+                        Icon(Icons.movie, color: BrutalistTheme.darkConcrete, size: 40),
+                        // Play overlay
+                        Container(
+                          width: 36,
+                          height: 36,
+                          decoration: BoxDecoration(
+                            color: BrutalistTheme.accent.withValues(alpha: 0.9),
+                            border: Border.all(
+                                color: BrutalistTheme.white, width: 2),
+                          ),
+                          child: const Icon(Icons.play_arrow,
+                              color: BrutalistTheme.white, size: 20),
+                        ),
+                        // Format badge
+                        Positioned(
+                          top: 4,
+                          right: 4,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 5, vertical: 2),
+                            color: BrutalistTheme.accent,
+                            child: Text(
+                              file.extension
+                                  .replaceAll('.', '')
+                                  .toUpperCase(),
+                              style: BrutalistTheme.bodySmall.copyWith(
+                                fontSize: 8,
+                                fontWeight: FontWeight.w700,
+                                color: BrutalistTheme.white,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    )
+                  : Center(
+                      child: Icon(icon, color: iconColor, size: 36),
+                    ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          // File name
+          Text(
+            file.name,
+            style: BrutalistTheme.bodySmall.copyWith(
+              fontWeight: FontWeight.w700,
+              fontSize: 11,
+            ),
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            textAlign: TextAlign.center,
+          ),
+          if (!file.isDirectory) ...[
+            const SizedBox(height: 2),
+            Text(
+              file.formattedSize,
+              style: BrutalistTheme.bodySmall.copyWith(fontSize: 10),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  String _getRelativePath(String fullPath, String shareName) {
+    final normalized = fullPath.replaceAll('\\', '/');
+    final sharePrefix = '/$shareName';
+    if (normalized.startsWith(sharePrefix)) {
+      final relative = normalized.substring(sharePrefix.length);
+      return relative.isEmpty ? '/' : relative;
+    }
+    return normalized;
+  }
+}
+
+/// Individual file/folder item (list view).
 class _FileItem extends StatelessWidget {
   final SmbFileInfo file;
 
@@ -267,7 +465,6 @@ class _FileItem extends StatelessWidget {
         onTap: isInteractive
             ? () async {
                 if (file.isDirectory) {
-                  // Extract relative path for navigation
                   final dirPath = _getRelativePath(
                       file.path, state.currentShare!);
                   await state.openDirectory(dirPath);
@@ -374,8 +571,6 @@ class _FileItem extends StatelessWidget {
   }
 
   String _getRelativePath(String fullPath, String shareName) {
-    // fullPath is like /shareName/path/to/dir
-    // We need to extract /path/to/dir
     final normalized = fullPath.replaceAll('\\', '/');
     final sharePrefix = '/$shareName';
     if (normalized.startsWith(sharePrefix)) {
@@ -385,12 +580,11 @@ class _FileItem extends StatelessWidget {
     return normalized;
   }
 
-  Future<void> _openVideo(
+  static Future<void> _openVideo(
     BuildContext context,
     AppState state,
     SmbFileInfo file,
   ) async {
-    // Collect all video files in the current directory for next/prev
     final allFiles = state.files;
     final videoFiles = allFiles.where((f) => f.isVideo).toList();
     final currentIndex = videoFiles.indexWhere((f) => f.path == file.path);
@@ -407,7 +601,6 @@ class _FileItem extends StatelessWidget {
     if (index < 0 || index >= videoFiles.length) return;
     final file = videoFiles[index];
 
-    // Show loading dialog
     showDialog(
       context: context,
       barrierDismissible: false,
@@ -455,7 +648,6 @@ class _FileItem extends StatelessWidget {
       Navigator.pop(context); // Close loading dialog
 
       if (url != null) {
-        // Replace the current video player screen
         Navigator.pushReplacement(
           context,
           MaterialPageRoute(

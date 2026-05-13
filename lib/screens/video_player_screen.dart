@@ -75,6 +75,15 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
   Timer? _volumeHideTimer;
   Timer? _brightnessHideTimer;
 
+  // ─── Auto-fix stall detection ─────────────────────────────────────
+  Timer? _stallTimer;
+  Duration _lastKnownPosition = Duration.zero;
+  bool _isAutoFixing = false;
+  int _autoFixAttempts = 0;
+  // ignore: unused_field
+  static const int _stallTimeoutSecs = 15;
+  static const int _maxAutoFixAttempts = 2;
+
   @override
   void initState() {
     super.initState();
@@ -144,10 +153,14 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
     // Start auto-hide timer
     _startHideTimer();
+
+    // Start stall detection
+    _startStallDetection();
   }
 
   @override
   void dispose() {
+    _stallTimer?.cancel();
     _positionSub?.cancel();
     _durationSub?.cancel();
     _bufferingSub?.cancel();
@@ -198,6 +211,78 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
         setState(() => _controlsVisible = false);
       }
     });
+  }
+
+  // ─── Stall Detection & Auto-Fix ───────────────────────────────────
+
+  void _startStallDetection() {
+    _stallTimer?.cancel();
+    _stallTimer = Timer.periodic(
+      const Duration(seconds: 5),
+      (_) => _checkForStall(),
+    );
+  }
+
+  void _checkForStall() {
+    if (_isAutoFixing || !mounted) return;
+    if (_autoFixAttempts >= _maxAutoFixAttempts) return;
+
+    // Only check if we're supposed to be playing but stuck buffering
+    final isStuck = _isBuffering &&
+        _position == _lastKnownPosition &&
+        _position == Duration.zero &&
+        _duration == Duration.zero;
+
+    if (isStuck) {
+      // Check how long we've been in this state — use a simple counter
+      _autoFixAttempts++;
+      _performAutoFix();
+    } else {
+      _lastKnownPosition = _position;
+    }
+  }
+
+  Future<void> _performAutoFix() async {
+    if (!mounted) return;
+    setState(() => _isAutoFixing = true);
+
+    try {
+      final state = context.read<AppState>();
+
+      // Save the file path before stopping (stopProxy clears it)
+      final savedFilePath = state.proxyService.filePath;
+      if (savedFilePath == null || savedFilePath.isEmpty) return;
+
+      // Step 1: Clear the chunk cache to remove any corrupted data
+      final cache = state.proxyService.cache;
+      if (cache != null) {
+        await cache.clearAndReset();
+      }
+
+      // Step 2: Stop and restart the proxy
+      await state.proxyService.stopProxy();
+
+      // Brief pause to let resources clean up
+      await Future.delayed(const Duration(milliseconds: 500));
+
+      // Step 3: Restart proxy with same file
+      final url = await state.proxyService.startProxy(
+        smbService: state.smbService,
+        filePath: savedFilePath,
+      );
+
+      if (!mounted) return;
+
+      // Step 4: Reload the video with the new URL
+      await _player.stop();
+      await _player.open(Media(url));
+    } catch (e) {
+      // If auto-fix fails, just continue — user can manually retry
+    } finally {
+      if (mounted) {
+        setState(() => _isAutoFixing = false);
+      }
+    }
   }
 
   // ─── Double-Tap Skip ──────────────────────────────────────────────
@@ -357,14 +442,39 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen>
 
           // ─── BUFFERING INDICATOR ───────
           if (_isBuffering)
-            const Center(
-              child: SizedBox(
-                width: 48,
-                height: 48,
-                child: CircularProgressIndicator(
-                  strokeWidth: 4,
-                  color: BrutalistTheme.accent,
-                ),
+            Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const SizedBox(
+                    width: 48,
+                    height: 48,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 4,
+                      color: BrutalistTheme.accent,
+                    ),
+                  ),
+                  if (_isAutoFixing) ...[
+                    const SizedBox(height: 16),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 16, vertical: 8),
+                      decoration: BoxDecoration(
+                        color: BrutalistTheme.black.withValues(alpha: 0.85),
+                        border: Border.all(
+                            color: BrutalistTheme.warning, width: 2),
+                      ),
+                      child: Text(
+                        'AUTO-FIXING: CLEARING CACHE...',
+                        style: BrutalistTheme.mono.copyWith(
+                          color: BrutalistTheme.warning,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
               ),
             ),
 

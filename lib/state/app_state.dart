@@ -7,6 +7,7 @@ import '../services/credential_storage_service.dart';
 import '../services/http_proxy_service.dart';
 import '../services/network_scanner_service.dart';
 import '../services/smb_service.dart';
+import '../services/video_chunk_cache.dart';
 
 /// Application state using ChangeNotifier for provider-based state management.
 class AppState extends ChangeNotifier {
@@ -291,6 +292,19 @@ class AppState extends ChangeNotifier {
     _currentVideoUrl = null;
     _currentVideoName = null;
     notifyListeners();
+  }
+
+  // ─── CACHE MANAGEMENT ───────────────────────────────────
+
+  /// Clear all video chunk caches from disk.
+  /// Returns the number of bytes freed.
+  Future<int> clearAllCaches() async {
+    return await VideoChunkCache.clearAllCaches();
+  }
+
+  /// Get the total size of cached video chunks on disk.
+  Future<int> getCacheSize() async {
+    return await VideoChunkCache.getTotalCacheSize();
   }
 
   @override

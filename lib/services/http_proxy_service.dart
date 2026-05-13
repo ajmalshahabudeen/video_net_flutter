@@ -16,9 +16,13 @@ class HttpProxyService {
   HttpServer? _server;
   VideoChunkCache? _cache;
   int? _fileSize;
+  String? _filePath;
 
   int? get port => _server?.port;
   bool get isRunning => _server != null;
+
+  /// Expose the file path for auto-fix reconnection.
+  String? get filePath => _filePath;
 
   /// Expose cache for progress/diagnostics if needed.
   VideoChunkCache? get cache => _cache;
@@ -35,6 +39,7 @@ class HttpProxyService {
     await stopProxy();
 
     _fileSize = await smbService.getFileSize(filePath);
+    _filePath = filePath;
 
     _cache = VideoChunkCache(
       smbService: smbService,
@@ -144,5 +149,6 @@ class HttpProxyService {
       _cache = null;
     }
     _fileSize = null;
+    _filePath = null;
   }
 }

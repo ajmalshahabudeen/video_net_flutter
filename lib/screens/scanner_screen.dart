@@ -20,12 +20,46 @@ class ScannerScreen extends StatefulWidget {
 }
 
 class _ScannerScreenState extends State<ScannerScreen> {
+  int _cachedBytes = 0;
+  bool _cacheCleared = false;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       UpdateService.checkForUpdates(context);
+      _autoClearCache();
     });
+  }
+
+  /// Automatically clear stale video caches when returning to home screen.
+  Future<void> _autoClearCache() async {
+    final state = context.read<AppState>();
+    final cacheSize = await state.getCacheSize();
+    if (cacheSize > 0) {
+      final cleared = await state.clearAllCaches();
+      if (mounted) {
+        setState(() {
+          _cachedBytes = cleared;
+          _cacheCleared = true;
+        });
+        // Auto-dismiss the cache notification after 4 seconds
+        Future.delayed(const Duration(seconds: 4), () {
+          if (mounted) {
+            setState(() => _cacheCleared = false);
+          }
+        });
+      }
+    }
+  }
+
+  String _formatBytes(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
   }
 
   @override
@@ -72,6 +106,44 @@ class _ScannerScreenState extends State<ScannerScreen> {
                     ),
                   ),
                 ),
+
+                // ─── CACHE CLEARED NOTIFICATION ────
+                if (_cacheCleared && _cachedBytes > 0)
+                  SliverToBoxAdapter(
+                    child: Container(
+                      margin: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 14, vertical: 10),
+                      decoration: BoxDecoration(
+                        color: BrutalistTheme.portOpen.withValues(alpha: 0.12),
+                        border: Border.all(
+                            color: BrutalistTheme.portOpen, width: 2),
+                      ),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.cleaning_services,
+                              color: BrutalistTheme.portOpen, size: 18),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Text(
+                              'CACHE CLEARED: ${_formatBytes(_cachedBytes)} freed',
+                              style: BrutalistTheme.mono.copyWith(
+                                color: BrutalistTheme.portOpen,
+                                fontSize: 11,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          ),
+                          GestureDetector(
+                            onTap: () =>
+                                setState(() => _cacheCleared = false),
+                            child: const Icon(Icons.close,
+                                color: BrutalistTheme.portOpen, size: 16),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
 
                 // ─── LOCAL IP INFO ─────────────────
                 if (state.localIp != null)
