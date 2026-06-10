@@ -1,3 +1,4 @@
+// ignore_for_file: avoid_print
 import 'dart:async';
 import 'dart:io';
 import 'dart:math';
@@ -258,11 +259,14 @@ class VideoChunkCache {
       // Retry loop
       for (int attempt = 1; attempt <= maxRetries; attempt++) {
         try {
+          print('[VideoChunkCache] Fetching chunk $idx (attempt $attempt/3)...');
           await _fetchFromSmb(idx);
           _cached.add(idx);
           _failedChunks.remove(idx);
+          print('[VideoChunkCache] Chunk $idx fetched successfully.');
           break; // success
-        } catch (e) {
+        } catch (e, stackTrace) {
+          print('[VideoChunkCache] Error fetching chunk $idx (attempt $attempt/3): $e\n$stackTrace');
           if (attempt == maxRetries) {
             _failedChunks.add(idx);
             // Swallow — caller will see the chunk is still missing.

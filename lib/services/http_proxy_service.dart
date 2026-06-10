@@ -1,3 +1,4 @@
+// ignore_for_file: avoid_print
 import 'dart:async';
 import 'dart:io';
 import 'dart:math';
@@ -52,10 +53,15 @@ class HttpProxyService {
     // in parallel so media_kit can start playing almost immediately.
     unawaited(_cache!.preWarm());
 
+    final fileName = filePath.replaceAll('\\', '/').split('/').last;
+    final encodedName = Uri.encodeComponent(fileName);
+
     _server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     _server!.listen(_handleRequest);
 
-    return 'http://127.0.0.1:${_server!.port}/video';
+    final proxyUrl = 'http://127.0.0.1:${_server!.port}/$encodedName';
+    print('[HttpProxyService] Starting proxy for $filePath ($_fileSize bytes) on $proxyUrl');
+    return proxyUrl;
   }
 
   /// Handle incoming HTTP requests from media_kit.
@@ -73,6 +79,7 @@ class HttpProxyService {
     try {
       // ── Parse Range header ──────────────────────────────
       final rangeHeader = request.headers.value('range');
+      print('[HttpProxyService] Request: ${request.method} ${request.uri.path} (Range: $rangeHeader)');
       int start = 0;
       int end = fileSize - 1;
       bool isPartial = false;
@@ -113,7 +120,8 @@ class HttpProxyService {
       }
 
       await request.response.close();
-    } catch (e) {
+    } catch (e, stackTrace) {
+      print('[HttpProxyService] Error handling request: $e\n$stackTrace');
       try {
         request.response.statusCode = 500;
         request.response.write('Error: $e');
